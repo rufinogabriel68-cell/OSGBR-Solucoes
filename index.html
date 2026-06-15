@@ -9,22 +9,28 @@
 <script>
 // ═══════════════════════════════════════════════════════════════
 //  FIREBASE — carregado antes do DOM
-//  SYNC FIX v2 (pull-then-push):
-//  - Antes de salvar, busca a versão atual do servidor (get()).
-//  - Se houver alterações de outro dispositivo mais recentes que a
-//    última versão remota já absorvida nesta aba, aplica-as em S
-//    ANTES de montar o payload local.
-//  - Só então grava o payload (que já contém o que veio do servidor
-//    + as mudanças locais), evitando que exclusões feitas em outro
-//    dispositivo sejam "ressuscitadas" por uma versão local antiga.
-//  - O listener onValue continua tratando atualizações em tempo real
-//    e ignorando ecos da própria aba via _clientId/_savedAt.
+//  SYNC FIX v3:
+//  - Tombstones: exclusões ficam registradas e nunca ressuscitam
+//  - Pull-then-push com deduplicação por ID
+//  - localStorage só como cache — nuvem é a fonte da verdade
+//  - Modos: cloud (Firebase), local (1 PC), readonly (celular consulta)
+//  - Trava de editor único evita 2 dispositivos salvando ao mesmo tempo
 // ═══════════════════════════════════════════════════════════════
 
 const CLIENT_ID = Math.random().toString(36).slice(2,9) + Date.now().toString(36);
 window.CLIENT_ID = CLIENT_ID;
-let lastSavedAt = 0; // timestamp do último save feito NESTA aba
-let lastRemoteAppliedAt = 0; // timestamp do último dado remoto já absorvido em S
+let lastSavedAt = 0;
+let lastSaveSeq = 0;
+let lastRemoteSeq = 0;
+let _cloudReady = false;
+let _hasEditorLock = false;
+let _lockHeartbeat = null;
+window._readonly = false;
+
+function getSyncMode(){
+  return localStorage.getItem('gbr_sync_mode') || 'cloud';
+}
+function isCloudMode(){ return getSyncMode() === 'cloud'; }
 
 function setSS(type, msg){
   const dot = document.getElementById('sdot');
@@ -80,22 +86,29 @@ async function initFB(){
 
         dbListener = onValue(dbRef, snap => {
           if(!snap.exists()){
-            // Firebase vazio — push dados locais
-            window.fbSave();
+            const hasLocal = !!localStorage.getItem('gbr_v2');
+            _cloudReady = true;
+            if(hasLocal){
+              window.fbSave();
+            } else {
+              setSS('warn','Nuvem vazia — salve para sincronizar');
+              safeRender();
+            }
             return;
           }
           const data = snap.val();
-          // ── SYNC FIX: É eco desta aba se veio de mim e é recente ──
-          const isMyEcho = (data._clientId === CLIENT_ID) && (data._savedAt >= lastSavedAt - 100);
+          const remoteSeq = data._saveSeq || 0;
+          const isMyEcho = (data._clientId === CLIENT_ID) && (remoteSeq === lastSaveSeq) && (data._savedAt === lastSavedAt);
           if(isMyEcho){
-            lastRemoteAppliedAt = data._savedAt || lastRemoteAppliedAt;
+            lastRemoteSeq = remoteSeq;
+            _cloudReady = true;
             setSS('ok','Salvo — ' + new Date().toLocaleTimeString('pt-BR'));
             return;
           }
-          // Veio de outro dispositivo (ou é o carregamento inicial) → aplica
-          if((data._savedAt || 0) > lastRemoteAppliedAt){
+          if(remoteSeq > lastRemoteSeq || !_cloudReady){
             applyRemoteData(data);
-            lastRemoteAppliedAt = data._savedAt || lastRemoteAppliedAt;
+            lastRemoteSeq = remoteSeq;
+            _cloudReady = true;
             safeRender();
           }
           setSS('ok','Sincronizado — ' + new Date().toLocaleTimeString('pt-BR'));
@@ -116,39 +129,47 @@ async function initFB(){
 }
 
 window.fbSave = async function(){
+  if(window._readonly){
+    setSS('warn','Modo consulta — importe um backup no PC para atualizar');
+    return;
+  }
+  if(!isCloudMode()){
+    lSave();
+    setSS('ok','Salvo localmente — ' + new Date().toLocaleTimeString('pt-BR'));
+    return;
+  }
   if(!getAuthInstance() || !getAuthInstance().currentUser){
     setSS('err','Desconectado. Faça login novamente.');
     return;
   }
-  if(_pendingSave) return; // evita save duplo simultâneo
+  if(_pendingSave) return;
   _pendingSave = true;
   setSS('loading','Salvando...');
   try {
-    // PULL: busca a versão mais recente do servidor ANTES de salvar.
-    // Evita que dados locais "desatualizados" (ex: aba ficou aberta
-    // e outro dispositivo apagou algo nesse meio tempo) ressuscitem
-    // itens já removidos em outro lugar.
+    const gotLock = await tryAcquireEditorLock();
+    if(!gotLock){
+      setSS('warn','Outro dispositivo está editando — dados atualizados');
+      _pendingSave = false;
+      return;
+    }
     try {
       const snap = await _firebase.get(dbRef);
       if(snap.exists()){
         const remote = snap.val();
-        const isMyOwnPreviousSave = (remote._clientId === CLIENT_ID) && (remote._savedAt >= lastSavedAt - 100);
-        if(!isMyOwnPreviousSave && (remote._savedAt || 0) > (lastRemoteAppliedAt || 0)){
-          // Há uma versão mais nova de outro dispositivo: absorve antes de sobrescrever
+        const remoteSeq = remote._saveSeq || 0;
+        const isMyOwnPreviousSave = (remote._clientId === CLIENT_ID) && (remoteSeq === lastSaveSeq);
+        if(!isMyOwnPreviousSave && remoteSeq > lastRemoteSeq){
           applyRemoteData(remote);
-          lastRemoteAppliedAt = remote._savedAt || 0;
+          lastRemoteSeq = remoteSeq;
           safeRender();
         }
       }
-    } catch(pullErr){
-      // Se o pull falhar (ex: offline momentâneo), segue com push normal
-    }
+    } catch(pullErr){}
 
-    // PUSH: agora S já está atualizado com o que havia no servidor + as
-    // alterações locais novas, então o save não sobrescreve nada perdido.
     const payload = buildPayload();
-    lastSavedAt = payload._savedAt; // registra o timestamp ANTES do set
-    lastRemoteAppliedAt = payload._savedAt;
+    lastSavedAt = payload._savedAt;
+    lastSaveSeq = payload._saveSeq;
+    lastRemoteSeq = payload._saveSeq;
     await _firebase.set(dbRef, payload);
     lSave();
     setSS('ok','Salvo — ' + new Date().toLocaleTimeString('pt-BR'));
@@ -178,9 +199,64 @@ function doLogin(){
 }
 window.doLogin = doLogin;
 
-window.scheduleSave = function(){ clearTimeout(saveTO); saveTO = setTimeout(() => window.fbSave(), 1500); };
+window.scheduleSave = function(){
+  if(window._readonly) return;
+  clearTimeout(saveTO);
+  saveTO = setTimeout(() => window.fbSave(), 1500);
+};
 
-document.addEventListener('DOMContentLoaded', initFB);
+async function tryAcquireEditorLock(){
+  if(!_firebase || !db) return true;
+  const lockRef = _firebase.ref(db, 'gbr/editorLock');
+  const snap = await _firebase.get(lockRef);
+  const now = Date.now();
+  const lock = snap.exists() ? snap.val() : null;
+  if(lock && lock.clientId !== CLIENT_ID && (now - (lock.heartbeat || 0)) < 90000){
+    try {
+      const dataSnap = await _firebase.get(dbRef);
+      if(dataSnap.exists()) applyRemoteData(dataSnap.val());
+      safeRender();
+    } catch(e){}
+    return false;
+  }
+  await _firebase.set(lockRef, { clientId: CLIENT_ID, heartbeat: now, savedAt: now });
+  _hasEditorLock = true;
+  clearInterval(_lockHeartbeat);
+  _lockHeartbeat = setInterval(() => {
+    if(_hasEditorLock) _firebase.update(lockRef, { heartbeat: Date.now() }).catch(()=>{});
+  }, 25000);
+  return true;
+}
+
+function enterOfflineApp(mode){
+  document.getElementById('lscreen').style.display = 'none';
+  document.getElementById('approot').style.display = 'flex';
+  lLoad();
+  window._readonly = (mode === 'readonly');
+  setSS(mode === 'readonly' ? 'warn' : 'ok',
+    mode === 'readonly' ? 'Modo consulta — somente leitura' : 'Modo local — dados neste dispositivo');
+  safeRender();
+}
+
+function setSyncMode(mode){
+  if(!['cloud','local','readonly'].includes(mode)) return;
+  if(mode === getSyncMode()) return;
+  const msg = mode === 'cloud'
+    ? 'Ativar sincronização na nuvem (Firebase)? Requer login.'
+    : mode === 'local'
+    ? 'Usar somente este dispositivo? Dados ficam no navegador, sem nuvem.'
+    : 'Modo consulta no celular? Você verá os dados mas não poderá alterar.';
+  if(!confirm(msg)) return;
+  localStorage.setItem('gbr_sync_mode', mode);
+  location.reload();
+}
+window.setSyncMode = setSyncMode;
+
+document.addEventListener('DOMContentLoaded', () => {
+  const mode = getSyncMode();
+  if(mode === 'local' || mode === 'readonly') enterOfflineApp(mode);
+  else initFB();
+});
 </script>
 
 <style>
@@ -1031,6 +1107,12 @@ tr:hover td { background: var(--surface2); }
       onkeydown="if(event.key==='Enter')doLogin()">
     <button class="login-btn" onclick="window.doLogin()">Entrar no Sistema</button>
     <div class="login-err" id="lerr"></div>
+    <div style="margin-top:16px;font-size:11px;color:var(--muted);text-align:center;line-height:1.6">
+      Sem internet ou prefere usar só no PC?<br>
+      <a href="#" onclick="setSyncMode('local');return false" style="color:var(--primary2)">Modo local (sem nuvem)</a>
+      ·
+      <a href="#" onclick="setSyncMode('readonly');return false" style="color:var(--primary2)">Modo consulta (celular)</a>
+    </div>
   </div>
 </div>
 
@@ -1225,6 +1307,7 @@ const S = {
   calcItems:[], calcMode:'medio', calcDesc:0, calcUrg:0, calcDesl:0, calcCom:0,
   nextOrc:6, nextEst:10, nextCli:5, nextAg:5, nextLead:4, nextGar:4, nextNota:1, nextGasto:1, nextOS:1,
   chamadosRejeitados:[],
+  _tombstones:{},
   osQ:'', osTab:'abertas',
   os:[],
   notas:[
@@ -1245,24 +1328,74 @@ const ORIGENS = ['Indicação','Instagram','Google','WhatsApp','Passagem','Outro
 // ═══════════════════════════════════════════
 //  STORAGE & SYNC
 // ═══════════════════════════════════════════
+const SYNC_COLLECTIONS = ['services','orc','os','clientes','leads','garantias','estoque','agenda','notas','recExtras'];
+
+function initTombstones(){
+  if(!S._tombstones) S._tombstones = {};
+  SYNC_COLLECTIONS.forEach(k => { if(!S._tombstones[k]) S._tombstones[k] = {}; });
+}
+
+function recordTombstone(collection, id){
+  initTombstones();
+  S._tombstones[collection][String(id)] = Date.now();
+}
+
+function mergeTombstones(remote, local){
+  initTombstones();
+  const merged = {};
+  SYNC_COLLECTIONS.forEach(col => {
+    merged[col] = { ...(remote?.[col]||{}), ...(local?.[col]||{}) };
+    Object.keys(local?.[col]||{}).forEach(id => {
+      if((local[col][id]||0) > (merged[col][id]||0)) merged[col][id] = local[col][id];
+    });
+    Object.keys(remote?.[col]||{}).forEach(id => {
+      if((remote[col][id]||0) > (merged[col][id]||0)) merged[col][id] = remote[col][id];
+    });
+  });
+  return merged;
+}
+
+function filterTombstones(collection, arr){
+  if(!Array.isArray(arr)) return [];
+  const tombs = (S._tombstones && S._tombstones[collection]) || {};
+  return arr.filter(item => item && item.id !== undefined && !tombs[String(item.id)]);
+}
+
+function dedupeById(arr){
+  if(!Array.isArray(arr)) return [];
+  const seen = new Map();
+  arr.forEach(item => { if(item && item.id !== undefined) seen.set(String(item.id), item); });
+  return Array.from(seen.values());
+}
+
 function buildPayload(){
+  initTombstones();
+  const seq = Math.max(lastRemoteSeq, lastSaveSeq) + 1;
   return {
-    services:S.services, orc:S.orc, os:S.os, clientes:S.clientes, leads:S.leads,
-    garantias:S.garantias, estoque:S.estoque, movEstoque:S.movEstoque,
-    agenda:S.agenda, gastos:S.gastos, notas:S.notas, recExtras:S.recExtras,
+    services:filterTombstones('services', dedupeById(S.services)),
+    orc:filterTombstones('orc', dedupeById(S.orc)),
+    os:filterTombstones('os', dedupeById(S.os||[])),
+    clientes:filterTombstones('clientes', dedupeById(S.clientes)),
+    leads:filterTombstones('leads', dedupeById(S.leads)),
+    garantias:filterTombstones('garantias', dedupeById(S.garantias)),
+    estoque:filterTombstones('estoque', dedupeById(S.estoque)),
+    movEstoque:S.movEstoque, agenda:filterTombstones('agenda', dedupeById(S.agenda)),
+    gastos:S.gastos, notas:filterTombstones('notas', dedupeById(S.notas)),
+    recExtras:filterTombstones('recExtras', dedupeById(S.recExtras)),
     cfg:S.cfg, categorias:S.categorias,
     chamadosRejeitados: S.chamadosRejeitados||[],
+    _tombstones: S._tombstones,
     nextOrc:S.nextOrc, nextEst:S.nextEst, nextCli:S.nextCli, nextOS:S.nextOS||1,
     nextAg:S.nextAg, nextLead:S.nextLead, nextGar:S.nextGar,
     nextNota:S.nextNota, nextRecExtra:S.nextRecExtra, nextGasto:S.nextGasto||1,
     _clientId: window.CLIENT_ID,
+    _saveSeq: seq,
     _savedAt: Date.now(),
     updatedAt: new Date().toISOString()
   };
 }
 
 function applyRemoteData(d){
-  // Preserva estado de UI (navegação, filtros, calculadora)
   const ui = {
     page:S.page, crmTab:S.crmTab, estTab:S.estTab, finTab:S.finTab,
     srvQ:S.srvQ, srvCat:S.srvCat, orcQ:S.orcQ, cliQ:S.cliQ,
@@ -1270,11 +1403,13 @@ function applyRemoteData(d){
     calcItems:S.calcItems, calcMode:S.calcMode,
     calcDesc:S.calcDesc, calcUrg:S.calcUrg, calcDesl:S.calcDesl, calcCom:S.calcCom
   };
-  // Substitui dados com Firebase como fonte da verdade
-  ['services','orc','os','clientes','leads','garantias','estoque','movEstoque',
-   'agenda','gastos','categorias','notas','recExtras'].forEach(k => {
-    if(d[k] !== undefined) S[k] = d[k];
+  S._tombstones = mergeTombstones(d._tombstones||{}, S._tombstones||{});
+  SYNC_COLLECTIONS.forEach(k => {
+    if(d[k] !== undefined) S[k] = filterTombstones(k, dedupeById(d[k]));
   });
+  if(d.movEstoque !== undefined) S.movEstoque = d.movEstoque;
+  if(d.gastos !== undefined) S.gastos = d.gastos;
+  if(d.categorias) S.categorias = d.categorias;
   if(d.cfg) Object.assign(S.cfg, d.cfg);
   if(Array.isArray(d.chamadosRejeitados)) S.chamadosRejeitados = d.chamadosRejeitados;
   ['nextOrc','nextEst','nextCli','nextAg','nextLead','nextGar',
@@ -1297,16 +1432,20 @@ function lLoad(){
   return false;
 }
 function applyLocalData(d){
-  // mesma lógica mas sem atualizar localStorage (evita loop)
-  ['services','orc','os','clientes','leads','garantias','estoque','movEstoque',
-   'agenda','gastos','categorias','notas','recExtras'].forEach(k => {
-    if(d[k] !== undefined) S[k] = d[k];
+  if(d._tombstones) S._tombstones = mergeTombstones(d._tombstones, S._tombstones||{});
+  SYNC_COLLECTIONS.forEach(k => {
+    if(d[k] !== undefined) S[k] = filterTombstones(k, dedupeById(d[k]));
   });
+  if(d.movEstoque !== undefined) S.movEstoque = d.movEstoque;
+  if(d.gastos !== undefined) S.gastos = d.gastos;
+  if(d.categorias) S.categorias = d.categorias;
   if(d.cfg) Object.assign(S.cfg, d.cfg);
+  if(Array.isArray(d.chamadosRejeitados)) S.chamadosRejeitados = d.chamadosRejeitados;
   ['nextOrc','nextEst','nextCli','nextAg','nextLead','nextGar',
    'nextNota','nextRecExtra','nextGasto','nextOS'].forEach(k => {
     if(d[k] !== undefined) S[k] = d[k];
   });
+  if(d._saveSeq) lastRemoteSeq = Math.max(lastRemoteSeq, d._saveSeq);
 }
 function exportJSON(){
   const b = new Blob([JSON.stringify(buildPayload(),null,2)], {type:'application/json'});
@@ -1320,14 +1459,20 @@ function handleImport(e){
   if(!f) return;
   const r = new FileReader();
   r.onload = ev => {
-    try { applyLocalData(JSON.parse(ev.target.result)); render(); lSave(); }
+    try {
+      applyLocalData(JSON.parse(ev.target.result));
+      render();
+      lSave();
+      if(isCloudMode() && !window._readonly) window.fbSave();
+      alert('✅ Dados importados com sucesso!');
+    }
     catch(x){ alert('Arquivo inválido'); }
   };
   r.readAsText(f);
   e.target.value = '';
 }
-function auto(){ window.scheduleSave && window.scheduleSave(); }
-lLoad(); // carrega cache offline
+function auto(){ if(!window._readonly) window.scheduleSave && window.scheduleSave(); }
+if(!isCloudMode()) lLoad();
 
 // ═══════════════════════════════════════════
 //  NAVEGAÇÃO
@@ -2103,12 +2248,39 @@ function rConfig(){
       <div class="fl"><label>Urgência padrão (%)</label><input id="cf-urg" type="number" value="${S.cfg.urgencial}"></div>
     </div>
   </div>
-  <div class="cs"><div class="cs-t">☁️ Firebase & Sincronização</div>
-    <div class="alert ok">✅ Conectado ao projeto <strong>sistemagbr</strong> — dados sincronizados entre todos os dispositivos.</div>
-    <div style="margin-top:10px;font-size:12px;color:var(--muted);line-height:1.6">
-      <strong style="color:var(--text)">Como funciona a sincronização:</strong><br>
-      Ao salvar em qualquer dispositivo, o Firebase é atualizado e todos os outros dispositivos recebem os dados automaticamente. O localStorage é apenas um cache offline.
+  <div class="cs"><div class="cs-t">☁️ Armazenamento & Sincronização</div>
+    ${(() => {
+      const mode = getSyncMode();
+      const modes = {
+        cloud: {icon:'☁️', label:'Nuvem (Firebase)', desc:'Sincroniza entre PC e celular. Exclusões e alterações propagam automaticamente.'},
+        local: {icon:'💻', label:'Somente este dispositivo', desc:'Dados ficam no navegador deste PC. Use Exportar/Importar para backup. Sem duplicação na nuvem.'},
+        readonly: {icon:'📱', label:'Consulta (celular)', desc:'Abra no celular para ver dados. Não salva alterações. Atualize importando backup do PC.'}
+      };
+      const cur = modes[mode] || modes.cloud;
+      return `<div class="alert ${mode==='cloud'?'ok':mode==='local'?'info':'warn'}" style="margin-bottom:12px">
+        ${cur.icon} <strong>Modo atual: ${cur.label}</strong><br>
+        <span style="font-size:12px">${cur.desc}</span>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn sm ${mode==='cloud'?'':'ghost'}" onclick="setSyncMode('cloud')">☁️ Nuvem</button>
+        <button class="btn sm ${mode==='local'?'':'ghost'}" onclick="setSyncMode('local')">💻 Local</button>
+        <button class="btn sm ${mode==='readonly'?'':'ghost'}" onclick="setSyncMode('readonly')">📱 Consulta</button>
+      </div>
+      <div style="font-size:12px;color:var(--muted);line-height:1.7">
+        <strong style="color:var(--text)">Correções v3 aplicadas:</strong><br>
+        • Exclusões registradas permanentemente (não voltam em outro aparelho)<br>
+        • Apenas 1 dispositivo edita por vez (evita conflitos)<br>
+        • Dados duplicados removidos automaticamente por ID<br>
+        • No modo nuvem, o cache local não sobrescreve mais a nuvem
+      </div>`;
+    })()}
+  </div>
+  <div class="cs"><div class="cs-t">💾 Backup Manual</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn" onclick="exportJSON()">📥 Exportar JSON</button>
+      <button class="btn ghost" onclick="document.getElementById('fimp').click()">📤 Importar JSON</button>
     </div>
+    <div style="margin-top:8px;font-size:11px;color:var(--muted)">Recomendado: exporte semanalmente como segurança extra.</div>
   </div>`;
 }
 
@@ -2192,7 +2364,7 @@ function salvarEditServ(id){
   s.dific=document.getElementById('edif').value; s.margem=+document.getElementById('emarg').value;
   closeM(); render(); auto();
 }
-function delServ(id){ if(confirm('Excluir este serviço?')){ S.services=S.services.filter(s=>s.id!==id); render(); auto(); } }
+function delServ(id){ if(confirm('Excluir este serviço?')){ recordTombstone('services', id); S.services=S.services.filter(s=>s.id!==id); render(); auto(); } }
 function addToCalc(id){ S.calcItems.push({id,qty:1}); pg('calc'); }
 function addCI(){ const id=+document.getElementById('csel').value; if(!id)return; const ex=S.calcItems.find(x=>x.id===id); if(ex)ex.qty++; else S.calcItems.push({id,qty:+document.getElementById('cqty').value||1}); render(); }
 
@@ -2269,7 +2441,7 @@ function salvarEditOrc(id){
   closeM(); render(); auto();
 }
 function dupOrc(id){ const o=S.orc.find(x=>x.id===id); if(!o)return; const nId='ORC-'+(String(S.nextOrc++).padStart(3,'0')); S.orc.push({...o,id:nId,status:'Aguardando',data:new Date().toISOString().slice(0,10)}); render(); auto(); }
-function delOrc(id){ if(confirm('Excluir este orçamento?')){ S.orc=S.orc.filter(o=>o.id!==id); render(); auto(); } }
+function delOrc(id){ if(confirm('Excluir este orçamento?')){ recordTombstone('orc', id); S.orc=S.orc.filter(o=>o.id!==id); render(); auto(); } }
 function mSalvarOrc(total,lucro){
   openM(`<div class="modal-t">💾 Salvar como Orçamento <button class="xbtn" onclick="closeM()">✕</button></div>
   <div class="fg">
@@ -2390,7 +2562,7 @@ function salvarFollowup(id){
   c.followupData=document.getElementById('ffd').value; c.followupStatus=document.getElementById('ffst').value;
   closeM(); render(); auto();
 }
-function delCli(id){ if(confirm('Excluir este cliente?')){ S.clientes=S.clientes.filter(c=>c.id!==id); render(); auto(); } }
+function delCli(id){ if(confirm('Excluir este cliente?')){ recordTombstone('clientes', id); S.clientes=S.clientes.filter(c=>c.id!==id); render(); auto(); } }
 
 // ── Leads ──
 function mNovoLead(){
@@ -2437,7 +2609,7 @@ function salvarEditLead(id){
   l.status=document.getElementById('est').value; l.valorEst=+document.getElementById('ev').value;
   l.obs=document.getElementById('eobs').value; closeM(); render(); auto();
 }
-function delLead(id){ if(confirm('Excluir este lead?')){ S.leads=S.leads.filter(l=>l.id!==id); render(); auto(); } }
+function delLead(id){ if(confirm('Excluir este lead?')){ recordTombstone('leads', id); S.leads=S.leads.filter(l=>l.id!==id); render(); auto(); } }
 
 // ── Garantias ──
 function mNovaGar(){
@@ -2509,7 +2681,7 @@ function salvarEditEst(id){
   e.local=document.getElementById('eloc').value; e.fornecedor=document.getElementById('ef').value;
   e.obs=document.getElementById('eobs').value; closeM(); render(); auto();
 }
-function delEst(id){ if(confirm('Excluir este item?')){ S.estoque=S.estoque.filter(e=>e.id!==id); render(); auto(); } }
+function delEst(id){ if(confirm('Excluir este item?')){ recordTombstone('estoque', id); S.estoque=S.estoque.filter(e=>e.id!==id); render(); auto(); } }
 function mEntrada(id){
   const e=S.estoque.find(x=>x.id===id); if(!e)return;
   openM(`<div class="modal-t">+ Entrada: ${e.nome} <button class="xbtn" onclick="closeM()">✕</button></div>
@@ -2580,7 +2752,7 @@ function salvarNovoAg(){
   S.agenda.push({id:S.nextAg++,dia:+document.getElementById('ad').value||11,titulo:document.getElementById('at').value||'Compromisso',hora:document.getElementById('ah').value||'09:00',status:document.getElementById('ast').value,tipo:document.getElementById('atipo').value,obs:document.getElementById('ao').value||''});
   closeM(); render(); auto();
 }
-function delAg(id){ if(confirm('Excluir?')){ S.agenda=S.agenda.filter(a=>a.id!==id); render(); auto(); } }
+function delAg(id){ if(confirm('Excluir?')){ recordTombstone('agenda', id); S.agenda=S.agenda.filter(a=>a.id!==id); render(); auto(); } }
 function toggleAg(id){ const a=S.agenda.find(x=>x.id===id); if(!a)return; a.status=a.status==='Confirmado'?'Aguardando':'Confirmado'; render(); auto(); }
 
 // ── Financeiro ──
@@ -2608,6 +2780,7 @@ function removerGarantiasVencidas(){
   if(!confirm(`Remover ${vencidas.length} garantia(s) vencida(s)?
 
 Isso não pode ser desfeito.`)) return;
+  vencidas.forEach(g => recordTombstone('garantias', g.id));
   S.garantias = S.garantias.filter(g=>dR(g.dataServico,g.diasGarantia)>0);
   render(); auto();
 }
@@ -2630,7 +2803,7 @@ function salvarNovaRecExtra(){
   S.recExtras.push({id:S.nextRecExtra++,desc:document.getElementById('rd').value||'Receita extra',valor:+document.getElementById('rv').value||0,data:document.getElementById('rdt').value,cat:document.getElementById('rcat').value});
   closeM(); render(); auto();
 }
-function delRecExtra(id){ if(confirm('Excluir receita extra?')){ S.recExtras=S.recExtras.filter(r=>r.id!==id); render(); auto(); } }
+function delRecExtra(id){ if(confirm('Excluir receita extra?')){ recordTombstone('recExtras', id); S.recExtras=S.recExtras.filter(r=>r.id!==id); render(); auto(); } }
 
 // ── Notas ──
 function mNovaNota(){
@@ -2681,7 +2854,7 @@ function salvarEditNota(id){
   n.fixada=document.getElementById('efix').value==='true';
   closeM(); render(); auto();
 }
-function delNota(id){ if(confirm('Excluir esta nota?')){ S.notas=S.notas.filter(n=>n.id!==id); render(); auto(); } }
+function delNota(id){ if(confirm('Excluir esta nota?')){ recordTombstone('notas', id); S.notas=S.notas.filter(n=>n.id!==id); render(); auto(); } }
 function toggleFixar(id){ const n=S.notas.find(x=>x.id===id); if(n){ n.fixada=!n.fixada; render(); auto(); } }
 function toggleCheck(notaId,checkId){ const n=S.notas.find(x=>x.id===notaId); if(!n||!n.checklist)return; const c=n.checklist.find(x=>x.id===checkId); if(c){ c.ok=!c.ok; render(); auto(); } }
 function addCheckItem(notaId){
@@ -3002,8 +3175,7 @@ function mudarStatusOS(id, novoStatus){
 function delOS(id){
   if(!confirm('Excluir esta OS?')) return;
   const os = S.os.find(x=>x.id===id);
-  // Se a OS veio de chamado de cliente, registra o ID como rejeitado
-  // e remove o nó do Firebase para não reimportar
+  recordTombstone('os', id);
   if(os && os.origem === 'cliente'){
     if(!S.chamadosRejeitados) S.chamadosRejeitados = [];
     if(!S.chamadosRejeitados.includes(id)) S.chamadosRejeitados.push(id);
